@@ -11,13 +11,15 @@ from requests import Response
 from fig import Service
 from fig.container import Container
 from fig.service import (
-    ConfigError,
-    split_port,
-    build_port_bindings,
-    parse_volume_spec,
-    build_volume_binding,
     APIError,
+    ConfigError,
+    build_port_bindings,
+    build_volume_binding,
+    get_container_data_volumes,
+    get_volume_bindings,
     parse_repository_tag,
+    parse_volume_spec,
+    split_port,
 )
 
 
@@ -56,13 +58,6 @@ class ServiceTest(unittest.TestCase):
             volumes_from=[mock.Mock(id=container_id, spec=Container)])
 
         self.assertEqual(service._get_volumes_from(), [container_id])
-
-    def test_get_volumes_from_intermediate_container(self):
-        container_id = 'aabbccddee'
-        service = Service('test')
-        container = mock.Mock(id=container_id, spec=Container)
-
-        self.assertEqual(service._get_volumes_from(container), [container_id])
 
     def test_get_volumes_from_service_container_exists(self):
         container_ids = ['aabbccddee', '12345']
@@ -189,20 +184,30 @@ class ServiceTest(unittest.TestCase):
         self.mock_client.pull.assert_called_once_with('someimage:sometag', insecure_registry=True)
         mock_log.info.assert_called_once_with('Pulling foo (someimage:sometag)...')
 
+    @mock.patch('fig.service.Container', autospec=True)
     @mock.patch('fig.service.log', autospec=True)
-    def test_create_container_from_insecure_registry(self, mock_log):
+    def test_create_container_from_insecure_registry(
+            self,
+            mock_log,
+            mock_container):
         service = Service('foo', client=self.mock_client, image='someimage:sometag')
         mock_response = mock.Mock(Response)
         mock_response.status_code = 404
         mock_response.reason = "Not Found"
-        Container.create = mock.Mock()
-        Container.create.side_effect = APIError('Mock error', mock_response, "No such image")
-        try:
+        mock_container.create.side_effect = APIError(
+            'Mock error', mock_response, "No such image")
+
+        # We expect the APIError because our service requires a
+        # non-existent image.
+        with self.assertRaises(APIError):
             service.create_container(insecure_registry=True)
-        except APIError:  # We expect the APIError because our service requires a non-existent image.
-            pass
-        self.mock_client.pull.assert_called_once_with('someimage:sometag', insecure_registry=True, stream=True)
-        mock_log.info.assert_called_once_with('Pulling image someimage:sometag...')
+
+        self.mock_client.pull.assert_called_once_with(
+            'someimage:sometag',
+            insecure_registry=True,
+            stream=True)
+        mock_log.info.assert_called_once_with(
+            'Pulling image someimage:sometag...')
 
     def test_parse_repository_tag(self):
         self.assertEqual(parse_repository_tag("root"), ("root", ""))
@@ -217,6 +222,23 @@ class ServiceTest(unittest.TestCase):
         Container.create = mock.Mock()
         service.create_container()
         self.assertEqual(Container.create.call_args[1]['image'], 'someimage:latest')
+
+    def test_create_container_with_build(self):
+        self.mock_client.images.return_value = []
+        service = Service('foo', client=self.mock_client, build='.')
+        service.build = mock.create_autospec(service.build)
+        service.create_container(do_build=True)
+
+        self.mock_client.images.assert_called_once_with(name=service.full_name)
+        service.build.assert_called_once_with()
+
+    def test_create_container_no_build(self):
+        self.mock_client.images.return_value = []
+        service = Service('foo', client=self.mock_client, build='.')
+        service.create_container(do_build=False)
+
+        self.assertFalse(self.mock_client.images.called)
+        self.assertFalse(self.mock_client.build.called)
 
 
 class ServiceVolumesTest(unittest.TestCase):
@@ -260,6 +282,50 @@ class ServiceVolumesTest(unittest.TestCase):
         self.assertEqual(
             binding,
             ('/home/user', dict(bind='/home/user', ro=False)))
+
+    def test_get_container_data_volumes(self):
+        options = [
+            '/host/volume:/host/volume:ro',
+            '/new/volume',
+            '/existing/volume',
+        ]
+
+        container = Container(None, {
+            'Volumes': {
+                '/host/volume':     '/host/volume',
+                '/existing/volume': '/var/lib/docker/aaaaaaaa',
+                '/removed/volume':  '/var/lib/docker/bbbbbbbb',
+            },
+        }, has_been_inspected=True)
+
+        expected = {
+            '/var/lib/docker/aaaaaaaa': {'bind': '/existing/volume', 'ro': False},
+        }
+
+        binds = get_container_data_volumes(container, options)
+        self.assertEqual(binds, expected)
+
+    def test_get_volume_bindings(self):
+        options = [
+            '/host/volume:/host/volume:ro',
+            '/host/rw/volume:/host/rw/volume',
+            '/new/volume',
+            '/existing/volume',
+        ]
+
+        intermediate_container = Container(None, {
+            'Volumes': {'/existing/volume': '/var/lib/docker/aaaaaaaa'},
+            }, has_been_inspected=True)
+
+        expected = {
+            '/host/volume': {'bind': '/host/volume', 'ro': True},
+            '/host/rw/volume': {'bind': '/host/rw/volume', 'ro': False},
+            '/var/lib/docker/aaaaaaaa': {'bind': '/existing/volume', 'ro': False},
+        }
+
+        binds = get_volume_bindings(options, intermediate_container)
+        self.assertEqual(binds, expected)
+
 
 class ServiceEnvironmentTest(unittest.TestCase):
 

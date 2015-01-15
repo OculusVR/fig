@@ -18,6 +18,7 @@ log = logging.getLogger(__name__)
 DOCKER_CONFIG_KEYS = [
     'cap_add',
     'cap_drop',
+    'cpu_shares',
     'command',
     'detach',
     'dns',
@@ -41,6 +42,7 @@ DOCKER_CONFIG_KEYS = [
     'working_dir',
 ]
 DOCKER_CONFIG_HINTS = {
+    'cpu_share' : 'cpu_shares',
     'link'      : 'links',
     'port'      : 'ports',
     'privilege' : 'privileged',
@@ -49,6 +51,17 @@ DOCKER_CONFIG_HINTS = {
     'volume'    : 'volumes',
     'workdir'   : 'working_dir',
 }
+
+DOCKER_START_KEYS = [
+    'cap_add',
+    'cap_drop',
+    'dns',
+    'dns_search',
+    'env_file',
+    'net',
+    'privileged',
+    'restart',
+]
 
 VALID_NAME_CHARS = '[a-zA-Z0-9]'
 
@@ -74,7 +87,7 @@ ServiceName = namedtuple('ServiceName', 'project service number')
 
 
 class Service(object):
-    def __init__(self, name, client=None, project='default', links=None, volumes_from=None, **options):
+    def __init__(self, name, client=None, project='default', links=None, external_links=None, volumes_from=None, **options):
         if not re.match('^%s+$' % VALID_NAME_CHARS, name):
             raise ConfigError('Invalid service name "%s" - only %s are allowed' % (name, VALID_NAME_CHARS))
         if not re.match('^%s+$' % VALID_NAME_CHARS, project):
@@ -82,7 +95,8 @@ class Service(object):
         if 'image' in options and 'build' in options:
             raise ConfigError('Service %s has both an image and build path specified. A service can either be built to image or use an existing image, not both.' % name)
 
-        supported_options = DOCKER_CONFIG_KEYS + ['build', 'expose']
+        supported_options = DOCKER_CONFIG_KEYS + ['build', 'expose',
+                                                  'external_links']
 
         for k in options:
             if k not in supported_options:
@@ -95,6 +109,7 @@ class Service(object):
         self.client = client
         self.project = project
         self.links = links or []
+        self.external_links = external_links or []
         self.volumes_from = volumes_from or []
         self.options = options
 
@@ -145,7 +160,8 @@ class Service(object):
 
     def scale(self, desired_num):
         """
-        Adjusts the number of containers to the specified number and ensures they are running.
+        Adjusts the number of containers to the specified number and ensures
+        they are running.
 
         - creates containers until there are at least `desired_num`
         - stops containers until there are at most `desired_num` running
@@ -158,7 +174,7 @@ class Service(object):
         # Create enough containers
         containers = self.containers(stopped=True)
         while len(containers) < desired_num:
-            containers.append(self.create_container())
+            containers.append(self.create_container(detach=True))
 
         running_containers = []
         stopped_containers = []
@@ -192,12 +208,24 @@ class Service(object):
                 log.info("Removing %s..." % c.name)
                 c.remove(**options)
 
-    def create_container(self, one_off=False, insecure_registry=False, **override_options):
+    def create_container(self,
+                         one_off=False,
+                         insecure_registry=False,
+                         do_build=True,
+                         **override_options):
         """
         Create a container for this service. If the image doesn't exist, attempt to pull
         it.
         """
-        container_options = self._get_container_create_options(override_options, one_off=one_off)
+        container_options = self._get_container_create_options(
+            override_options,
+            one_off=one_off)
+
+        if (do_build and
+                self.can_be_built() and
+                not self.client.images(name=self.full_name)):
+            self.build()
+
         try:
             return Container.create(self.client, **container_options)
         except APIError as e:
@@ -212,31 +240,36 @@ class Service(object):
                 return Container.create(self.client, **container_options)
             raise
 
-    def recreate_containers(self, insecure_registry=False, **override_options):
+    def recreate_containers(self, insecure_registry=False, do_build=True, **override_options):
         """
-        If a container for this service doesn't exist, create and start one. If there are
-        any, stop them, create+start new ones, and remove the old containers.
+        If a container for this service doesn't exist, create and start one. If
+        there are any, stop them, create+start new ones, and remove the old
+        containers.
         """
         containers = self.containers(stopped=True)
         if not containers:
             log.info("Creating %s..." % self._next_container_name(containers))
-            container = self.create_container(insecure_registry=insecure_registry, **override_options)
+            container = self.create_container(
+                insecure_registry=insecure_registry,
+                do_build=do_build,
+                **override_options)
             self.start_container(container)
-            return [(None, container)]
+            return [container]
         else:
-            tuples = []
-
-            for c in containers:
-                log.info("Recreating %s..." % c.name)
-                tuples.append(self.recreate_container(c, insecure_registry=insecure_registry, **override_options))
-
-            return tuples
+            return [
+                self.recreate_container(
+                    container,
+                    insecure_registry=insecure_registry,
+                    **override_options)
+                for container in containers
+            ]
 
     def recreate_container(self, container, **override_options):
         """Recreate a container. An intermediate container is created so that
         the new container has the same name, while still supporting
         `volumes-from` the original container.
         """
+        log.info("Recreating %s..." % container.name)
         try:
             container.stop()
         except APIError as e:
@@ -247,23 +280,30 @@ class Service(object):
             else:
                 raise
 
+        intermediate_options = dict(self.options, **override_options)
         intermediate_container = Container.create(
             self.client,
             image=container.image,
             entrypoint=['/bin/echo'],
             command=[],
+            detach=True,
         )
-        intermediate_container.start(volumes_from=container.id)
+        intermediate_container.start(
+            binds=get_container_data_volumes(
+                container, intermediate_options.get('volumes')))
         intermediate_container.wait()
         container.remove()
 
+        # TODO: volumes are being passed to both start and create, this is
+        # probably unnecessary
         options = dict(override_options)
-        new_container = self.create_container(**options)
-        self.start_container(new_container, intermediate_container=intermediate_container)
+        new_container = self.create_container(do_build=False, **options)
+        self.start_container(
+            new_container,
+            intermediate_container=intermediate_container)
 
         intermediate_container.remove()
-
-        return (intermediate_container, new_container)
+        return new_container
 
     def start_container_if_stopped(self, container, **options):
         if container.is_running:
@@ -272,16 +312,9 @@ class Service(object):
             log.info("Starting %s..." % container.name)
             return self.start_container(container, **options)
 
-    def start_container(self, container=None, intermediate_container=None, **override_options):
-        container = container or self.create_container(**override_options)
+    def start_container(self, container, intermediate_container=None, **override_options):
         options = dict(self.options, **override_options)
         port_bindings = build_port_bindings(options.get('ports') or [])
-
-        volume_bindings = dict(
-            build_volume_binding(parse_volume_spec(volume))
-            for volume in options.get('volumes') or []
-            if ':' in volume)
-
         privileged = options.get('privileged', False)
         net = options.get('net', 'bridge')
         dns = options.get('dns', None)
@@ -290,12 +323,14 @@ class Service(object):
         cap_drop = options.get('cap_drop', None)
 
         restart = parse_restart_spec(options.get('restart', None))
+        binds = get_volume_bindings(
+            options.get('volumes'), intermediate_container)
 
         container.start(
             links=self._get_links(link_to_self=options.get('one_off', False)),
             port_bindings=port_bindings,
-            binds=volume_bindings,
-            volumes_from=self._get_volumes_from(intermediate_container),
+            binds=binds,
+            volumes_from=self._get_volumes_from(),
             privileged=privileged,
             network_mode=net,
             dns=dns,
@@ -306,12 +341,20 @@ class Service(object):
         )
         return container
 
-    def start_or_create_containers(self, insecure_registry=False):
+    def start_or_create_containers(
+            self,
+            insecure_registry=False,
+            detach=False,
+            do_build=True):
         containers = self.containers(stopped=True)
 
         if not containers:
             log.info("Creating %s..." % self._next_container_name(containers))
-            new_container = self.create_container(insecure_registry=insecure_registry)
+            new_container = self.create_container(
+                insecure_registry=insecure_registry,
+                detach=detach,
+                do_build=do_build,
+            )
             return [self.start_container(new_container)]
         else:
             return [self.start_container_if_stopped(c) for c in containers]
@@ -341,9 +384,15 @@ class Service(object):
                 links.append((container.name, self.name))
                 links.append((container.name, container.name))
                 links.append((container.name, container.name_without_project))
+        for external_link in self.external_links:
+            if ':' not in external_link:
+                link_name = external_link
+            else:
+                external_link, link_name = external_link.split(':')
+            links.append((external_link, link_name))
         return links
 
-    def _get_volumes_from(self, intermediate_container=None):
+    def _get_volumes_from(self):
         volumes_from = []
         for volume_source in self.volumes_from:
             if isinstance(volume_source, Service):
@@ -356,9 +405,6 @@ class Service(object):
 
             elif isinstance(volume_source, Container):
                 volumes_from.append(volume_source.id)
-
-        if intermediate_container:
-            volumes_from.append(intermediate_container.id)
 
         return volumes_from
 
@@ -403,16 +449,13 @@ class Service(object):
         container_options['environment'] = merge_environment(container_options)
 
         if self.can_be_built():
-            if len(self.client.images(name=self._build_tag_name())) == 0:
-                self.build()
-            container_options['image'] = self._build_tag_name()
+            container_options['image'] = self.full_name
         else:
             container_options['image'] = self._get_image_name(container_options['image'])
 
         # Delete options which are only used when starting
-        for key in ['privileged', 'net', 'dns', 'dns_search', 'restart', 'cap_add', 'cap_drop', 'env_file']:
-            if key in container_options:
-                del container_options[key]
+        for key in DOCKER_START_KEYS:
+            container_options.pop(key, None)
 
         return container_options
 
@@ -427,7 +470,7 @@ class Service(object):
 
         build_output = self.client.build(
             self.options['build'],
-            tag=self._build_tag_name(),
+            tag=self.full_name,
             stream=True,
             rm=True,
             nocache=no_cache,
@@ -447,14 +490,15 @@ class Service(object):
                     image_id = match.group(1)
 
         if image_id is None:
-            raise BuildError(self)
+            raise BuildError(self, event if all_events else 'Unknown')
 
         return image_id
 
     def can_be_built(self):
         return 'build' in self.options
 
-    def _build_tag_name(self):
+    @property
+    def full_name(self):
         """
         The tag to give to images built for this service.
         """
@@ -474,6 +518,45 @@ class Service(object):
                 image_name,
                 insecure_registry=insecure_registry
             )
+
+
+def get_container_data_volumes(container, volumes_option):
+    """Find the container data volumes that are in `volumes_option`, and return
+    a mapping of volume bindings for those volumes.
+    """
+    volumes = []
+    for volume in volumes_option or []:
+        volume = parse_volume_spec(volume)
+        # No need to preserve host volumes
+        if volume.external:
+            continue
+
+        volume_path = (container.get('Volumes') or {}).get(volume.internal)
+        # New volume, doesn't exist in the old container
+        if not volume_path:
+            continue
+
+        # Copy existing volume from old container
+        volume = volume._replace(external=volume_path)
+        volumes.append(build_volume_binding(volume))
+
+    return dict(volumes)
+
+
+def get_volume_bindings(volumes_option, intermediate_container):
+    """Return a list of volume bindings for a container. Container data volume
+    bindings are replaced by those in the intermediate container.
+    """
+    volume_bindings = dict(
+        build_volume_binding(parse_volume_spec(volume))
+        for volume in volumes_option or []
+        if ':' in volume)
+
+    if intermediate_container:
+        volume_bindings.update(
+            get_container_data_volumes(intermediate_container, volumes_option))
+
+    return volume_bindings
 
 
 NAME_RE = re.compile(r'^([^_]+)_([^_]+)_(run_)?(\d+)$')
